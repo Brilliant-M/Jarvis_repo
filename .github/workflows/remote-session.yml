@@ -1,0 +1,194 @@
+name: CI Worker Node
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker_id:
+        description: 'Worker ID'
+        required: true
+        default: 'generic-worker'
+      restore_source:
+        description: 'repo | artifact | release | all | none'
+        required: true
+        default: 'all'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  processor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+
+    steps:
+      - name: Initialize Network
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: ${{ github.event.inputs.worker_id }}
+          tags: tag:ci
+          args: --ssh
+
+      - name: Fetch Environment State
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+          REPO_NAME: ${{ secrets.BACKUP_REPO }}
+          ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
+          RESTORE_SOURCE: ${{ github.event.inputs.restore_source }}
+          TARGET_USER: ${{ github.event.inputs.worker_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p /home/runner/work
+          cd /home/runner/work
+
+          CLEAN_TOKEN=$(echo -n "$GH_TOKEN" | tr -d '[:space:]')
+          CLEAN_REPO=$(echo -n "$REPO_NAME" | tr -d '[:space:]')
+
+          decrypt_blob() {
+            local in="$1" out="$2"
+            for iter in 100000 10000 1000 1; do
+              if openssl enc -aes-256-cbc -d -pbkdf2 -iter "$iter" \
+                   -pass pass:"$ENC_PASS" -in "$in" -out "$out" 2>/dev/null; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          if [[ "$RESTORE_SOURCE" == "none" ]]; then exit 0; fi
+
+          if [[ "$RESTORE_SOURCE" == "repo" || "$RESTORE_SOURCE" == "all" ]]; then
+            if git clone "https://x-access-token:${CLEAN_TOKEN}@github.com/${{ github.repository_owner }}/${CLEAN_REPO}.git" state-repo 2>/dev/null; then
+              if ls state-repo/chunks/state_part_* 1>/dev/null 2>&1; then
+                cat state-repo/chunks/state_part_* > /tmp/repo.tar.gz.enc
+                if decrypt_blob /tmp/repo.tar.gz.enc /tmp/repo.tar.gz; then
+                  sudo tar -xzf /tmp/repo.tar.gz -C / --no-same-owner --overwrite
+                fi
+              fi
+            fi
+          fi
+
+          if [[ "$RESTORE_SOURCE" == "artifact" || "$RESTORE_SOURCE" == "all" ]]; then
+            ART_ID=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=state-backup" --jq '.artifacts | sort_by(.created_at) | last | .id' 2>/dev/null || echo "")
+            if [[ -n "$ART_ID" && "$ART_ID" != "null" ]]; then
+              gh api "repos/${{ github.repository }}/actions/artifacts/${ART_ID}/zip" > /tmp/artifact.zip
+              rm -rf /tmp/artifact && unzip -o /tmp/artifact.zip -d /tmp/artifact
+              if decrypt_blob /tmp/artifact/state.tar.gz.enc /tmp/artifact.tar.gz; then
+                sudo tar -xzf /tmp/artifact.tar.gz -C / --no-same-owner --overwrite
+              fi
+            fi
+          fi
+
+          if [[ "$RESTORE_SOURCE" == "release" || "$RESTORE_SOURCE" == "all" ]]; then
+            rm -rf /tmp/release && mkdir -p /tmp/release
+            if gh release download --repo "${{ github.repository }}" --pattern 'state.tar.gz.enc' --dir /tmp/release 2>/dev/null; then
+              if decrypt_blob /tmp/release/state.tar.gz.enc /tmp/release.tar.gz; then
+                sudo tar -xzf /tmp/release.tar.gz -C / --no-same-owner --overwrite
+              fi
+            fi
+          fi
+
+          if id "$TARGET_USER" &>/dev/null; then
+            sudo mkdir -p "/home/$TARGET_USER"
+            sudo chown -R "$TARGET_USER:$TARGET_USER" "/home/$TARGET_USER" 2>/dev/null || true
+          fi
+
+      - name: Process Workload
+        env:
+          CLOUD_INIT_B64: ${{ secrets.CLOUD_INIT_B64 }}
+        run: |
+          set -euo pipefail
+          TARGET_USER="${{ github.event.inputs.worker_id }}"
+
+          if ! id "$TARGET_USER" &>/dev/null; then
+            sudo useradd -m -s /bin/bash "$TARGET_USER"
+            sudo usermod -aG sudo "$TARGET_USER"
+          fi
+
+          sudo mkdir -p "/home/$TARGET_USER"
+          sudo chown -R "$TARGET_USER:$TARGET_USER" "/home/$TARGET_USER"
+          sudo chmod 755 "/home/$TARGET_USER"
+          echo "$TARGET_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/99-$TARGET_USER >/dev/null
+          sudo chmod 0440 /etc/sudoers.d/99-$TARGET_USER
+
+          if [ -n "${CLOUD_INIT_B64:-}" ]; then
+            echo "${CLOUD_INIT_B64}" | base64 -d | sudo tee "/home/$TARGET_USER/.cloud_init" > /dev/null
+            sudo chmod +x "/home/$TARGET_USER/.cloud_init"
+          fi
+
+          if [ -f "/home/$TARGET_USER/.cloud_init" ]; then
+            sudo -u "$TARGET_USER" bash "/home/$TARGET_USER/.cloud_init" > /tmp/cloud_init_output.log 2>&1 &
+            WORKLOAD_PID=$!
+            echo "$WORKLOAD_PID" | sudo tee "/home/$TARGET_USER/.cloud_init.pid" >/dev/null
+          fi
+
+          MAX_TICKS=$((5 * 60 * 60 / 10))
+          for i in $(seq 1 $MAX_TICKS); do
+            if [ -f /tmp/stop_worker ]; then break; fi
+            sleep 10
+          done
+
+      - name: Finalize Environment State
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+          REPO_NAME: ${{ secrets.BACKUP_REPO }}
+          ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
+          TARGET_USER: ${{ github.event.inputs.worker_id }}
+        run: |
+          set -euo pipefail
+          cd /home/runner/work
+          CLEAN_TOKEN=$(echo -n "$GH_TOKEN" | tr -d '[:space:]')
+          CLEAN_REPO=$(echo -n "$REPO_NAME" | tr -d '[:space:]')
+
+          if [ ! -d "/home/$TARGET_USER" ]; then
+            sudo mkdir -p "/home/$TARGET_USER"
+            sudo chown "$TARGET_USER:$TARGET_USER" "/home/$TARGET_USER"
+          fi
+
+          # ADDED EXCLUDES FOR HERMES SO IT DOESN'T CRASH THE BACKUP
+          sudo tar -czPf - \
+            --exclude=/home/runner/work/state-repo \
+            --exclude=/home/runner/work/_actions \
+            --exclude='*/.git' \
+            --exclude='/home/'"$TARGET_USER"'/.hermes' \
+            --exclude='/home/'"$TARGET_USER"'/.config/hermes' \
+            /home/runner/work /home/"$TARGET_USER" 2>/dev/null \
+            | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt \
+                -pass pass:"$ENC_PASS" -out /tmp/state.tar.gz.enc
+
+          sha256sum /tmp/state.tar.gz.enc | awk '{print $1}' > /tmp/state.sha256
+
+          mkdir -p /tmp/artifact-out
+          cp /tmp/state.tar.gz.enc /tmp/artifact-out/
+          cp /tmp/state.sha256      /tmp/artifact-out/
+
+          mkdir -p state-repo/chunks
+          rm -f state-repo/chunks/state_part_*
+          split -b 50M /tmp/state.tar.gz.enc state-repo/chunks/state_part_
+
+          cd state-repo
+          if [ ! -d ".git" ]; then git init; git branch -m main; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan temp-branch 2>/dev/null || git checkout temp-branch
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/state.sha256 ./state.sha256
+          git add chunks/ state.sha256
+          git commit -m "Automated State Finalization" || echo "nothing to commit"
+          git branch -M main
+          git push -f "https://x-access-token:${CLEAN_TOKEN}@github.com/${{ github.repository_owner }}/${CLEAN_REPO}.git" main
+
+          TAG="state-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$TAG" --repo "${{ github.repository }}" --title "Encrypted State $TAG" --notes "sha256: $(cat /tmp/state.sha256)" /tmp/state.tar.gz.enc /tmp/state.sha256 || true
+
+      - name: Upload Encrypted Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-backup
+          path: |
+            /tmp/artifact-out/state.tar.gz.enc
+            /tmp/artifact-out/state.sha256
+          retention-days: 30
